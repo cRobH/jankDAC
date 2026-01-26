@@ -128,13 +128,6 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-  
-  // init device stack on configured roothub port
-  tusb_rhport_init_t dev_init = {
-      .role = TUSB_ROLE_DEVICE,
-      .speed = TUSB_SPEED_AUTO};
-  tusb_init(BOARD_TUD_RHPORT, &dev_init);
-
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -155,14 +148,33 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
-  MX_USB_PCD_Init();
   MX_I2C1_Init();
   MX_I2S2_Init();
   MX_SPI1_Init();
   MX_ICACHE_Init();
   /* USER CODE BEGIN 2 */
-  
-  tusb_init();
+  // Enable USB clocking without HAL PCD init (TinyUSB handles the peripheral).
+  RCC_PeriphCLKInitTypeDef PeriphClkInitStruct = {0};
+  PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_USB;
+  PeriphClkInitStruct.UsbClockSelection = RCC_USBCLKSOURCE_HSI48;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  __HAL_RCC_USB_CLK_ENABLE();
+  #if defined(PWR_USBSCR_USB33DEN)
+  HAL_PWREx_EnableVddUSB();
+  #endif
+
+  // init device stack on configured roothub port
+  tusb_rhport_init_t dev_init = {
+      .role = TUSB_ROLE_DEVICE,
+      .speed = TUSB_SPEED_AUTO};
+  tusb_init(BOARD_TUD_RHPORT, &dev_init);
+  // Force a clean re-enumeration after TinyUSB is ready.
+  tud_disconnect();
+  tusb_time_delay_ms_api(10);
+  tud_connect();
 
   /* USER CODE END 2 */
 
@@ -200,8 +212,9 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI48|RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.HSI48State = RCC_HSI48_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLL1_SOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLM = 2;
@@ -403,6 +416,7 @@ static void MX_SPI1_Init(void)
   * @param None
   * @retval None
   */
+  
 static void MX_USB_PCD_Init(void)
 {
 
@@ -433,6 +447,7 @@ static void MX_USB_PCD_Init(void)
   /* USER CODE END USB_Init 2 */
 
 }
+
 
 /**
   * @brief GPIO Initialization Function

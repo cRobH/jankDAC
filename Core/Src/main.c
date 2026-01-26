@@ -1,4 +1,3 @@
-/* USER CODE BEGIN Header */
 /**
   ******************************************************************************
   * @file           : main.c
@@ -25,29 +24,26 @@ TODO:
 */
 
 
-/* USER CODE END Header */
-/* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include <inttypes.h>
+#include <math.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <string.h>
 
-/* Private includes ----------------------------------------------------------*/
-/* USER CODE BEGIN Includes */
 
 #include "board.h"
 #include "tusb.h"
 #include "usb_descriptors.h"
 
-/* USER CODE END Includes */
 
-/* Private typedef -----------------------------------------------------------*/
-/* USER CODE BEGIN PTD */
+#define PUTCHAR_PROTOTYPE int __io_putchar(int ch)
 
 
 // List of supported sample rates
 const uint32_t sample_rates[] = {44100, 48000};
 
-uint32_t current_sample_rate = 44100;
+uint32_t current_sample_rate = 48000; // was 44100;
 
 #define N_SAMPLE_RATES TU_ARRAY_SIZE(sample_rates)
 
@@ -80,29 +76,40 @@ enum {
 };
 
 
-/* USER CODE END PTD */
 
-/* Private define ------------------------------------------------------------*/
-/* USER CODE BEGIN PD */
 
-/* USER CODE END PD */
 
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
 
-/* USER CODE END PM */
 
-/* Private variables ---------------------------------------------------------*/
 
 COM_InitTypeDef BspCOMInit;
 
 I2S_HandleTypeDef hi2s2;
+DMA_NodeTypeDef Node_GPDMA1_Channel0;
+DMA_QListTypeDef List_GPDMA1_Channel0;
+DMA_HandleTypeDef handle_GPDMA1_Channel0;
+
+UART_HandleTypeDef huart3;
 
 PCD_HandleTypeDef hpcd_USB_DRD_FS;
 
-/* USER CODE BEGIN PV */
 
 static uint32_t blink_interval_ms = BLINK_NOT_MOUNTED;
+
+enum {
+  I2S_TX_BYTES_PER_SAMPLE = 2,
+  I2S_TX_CHANNELS = 2,
+  I2S_TX_SAMPLES_PER_MS = 48,
+  I2S_TX_MS_PER_HALF = 2,
+  I2S_TX_HALF_BYTES = I2S_TX_SAMPLES_PER_MS * I2S_TX_MS_PER_HALF * I2S_TX_CHANNELS * I2S_TX_BYTES_PER_SAMPLE,
+  I2S_TX_BUFFER_BYTES = I2S_TX_HALF_BYTES * 2,
+};
+
+static uint8_t i2s_tx_buf[I2S_TX_BUFFER_BYTES] __attribute__((aligned(4)));
+static volatile bool i2s_tx_half_pending = false;
+static volatile bool i2s_tx_full_pending = false;
+static volatile bool i2s_streaming = false;
+static volatile uint32_t i2s_tx_underflows = 0;
 
 // Audio controls
 // Current states
@@ -121,30 +128,31 @@ const uint8_t resolutions_per_format[CFG_TUD_AUDIO_FUNC_1_N_FORMATS] = {CFG_TUD_
 // Current resolution, update on format change
 uint8_t current_resolution;
 
-/* USER CODE END PV */
 
-/* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_GPDMA1_Init(void);
 static void MX_USB_PCD_Init(void);
 static void MX_ICACHE_Init(void);
 static void MX_I2S2_Init(void);
-/* USER CODE BEGIN PFP */
+static void MX_USART3_UART_Init(void);
 
 void led_blinking_task(void);
 void audio_task(void);
 void audio_control_task(void);
 
-/* USER CODE END PFP */
+static void i2s_tx_start(void);
+static void i2s_tx_stop(void);
+static void i2s_tx_set_sample_rate(uint32_t sample_rate);
+static void i2s_fill_half(bool first_half);
+static void i2s_apply_volume_16(int16_t *samples, uint32_t sample_count);
 
-/* Private user code ---------------------------------------------------------*/
-/* USER CODE BEGIN 0 */
+
 
 static uint32_t app_millis(void) {
   return HAL_GetTick();
 }
 
-/* USER CODE END 0 */
 
 /**
   * @brief  The application entry point.
@@ -153,55 +161,37 @@ static uint32_t app_millis(void) {
 int main(void)
 {
 
-  /* USER CODE BEGIN 1 */
 
-  /* USER CODE END 1 */
 
-  /* MCU Configuration--------------------------------------------------------*/
+  // MCU Configuration--------------------------------------------------------
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  // Reset of all peripherals, Initializes the Flash interface and the Systick.
   HAL_Init();
 
-  /* USER CODE BEGIN Init */
 
-  /* USER CODE END Init */
 
-  /* Configure the system clock */
+  // Configure the system clock
   SystemClock_Config();
 
-  /* USER CODE BEGIN SysInit */
 
-  /* USER CODE END SysInit */
 
-  /* Initialize all configured peripherals */
+  // Initialize all configured peripherals
   MX_GPIO_Init();
+  MX_GPDMA1_Init();
   MX_USB_PCD_Init();
   // Disabling Icache to see if it fixes the UID hard fault
  // MX_ICACHE_Init();
   MX_I2S2_Init();
-  /* USER CODE BEGIN 2 */
+  MX_USART3_UART_Init();
 
-  /* USER CODE END 2 */
 
-  /* Initialize led */
+  // Initialize led
   BSP_LED_Init(LED_GREEN);
 
-  /* Initialize USER push-button, will be used to trigger an interrupt each time it's pressed.*/
+  // Initialize USER push-button, will be used to trigger an interrupt each time it's pressed.
   BSP_PB_Init(BUTTON_USER, BUTTON_MODE_EXTI);
 
-  /* Initialize COM1 port (115200, 8 bits (7-bit data + 1 stop bit), no parity */
-  BspCOMInit.BaudRate   = 115200;
-  BspCOMInit.WordLength = COM_WORDLENGTH_8B;
-  BspCOMInit.StopBits   = COM_STOPBITS_1;
-  BspCOMInit.Parity     = COM_PARITY_NONE;
-  BspCOMInit.HwFlowCtl  = COM_HWCONTROL_NONE;
-  if (BSP_COM_Init(COM1, &BspCOMInit) != BSP_ERROR_NONE)
-  {
-    Error_Handler();
-  }
-
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
+  // Infinite loop
 
   // init device stack on configured roothub port
   tusb_rhport_init_t dev_init = {
@@ -214,20 +204,39 @@ int main(void)
 
   TU_LOG1("Headset running\r\n");
 
+  printf("Board Inited \r\n");
+  printf("Hello. \r\n");
+  {
+    const char msg[] = "HAL UART hello.\r\n";
+    (void) HAL_UART_Transmit(&huart3, (uint8_t *) msg, sizeof(msg) - 1, 1000);
+  }
+
 
   while (1)
   {
 
-    /* USER CODE END WHILE */
 
-    /* USER CODE BEGIN 3 */
     tud_task();// TinyUSB device task
     audio_task();
     audio_control_task();
     led_blinking_task();
   }
-  /* USER CODE END 3 */
 }
+
+/**
+  * @brief  Retargets the C library printf function to the USART.
+  *   None
+  * @retval None
+  */
+PUTCHAR_PROTOTYPE
+{
+  /* Place your implementation of fputc here */
+  /* e.g. write a character to the USART1 and Loop until the end of transmission */
+  HAL_UART_Transmit(&huart3, (uint8_t *)&ch, 1, 0xFFFF);
+
+  return ch;
+}
+
 
 /**
   * @brief System Clock Configuration
@@ -294,19 +303,12 @@ void SystemClock_Config(void)
 static void MX_I2S2_Init(void)
 {
 
-  /* USER CODE BEGIN I2S2_Init 0 */
-
-  /* USER CODE END I2S2_Init 0 */
-
-  /* USER CODE BEGIN I2S2_Init 1 */
-
-  /* USER CODE END I2S2_Init 1 */
   hi2s2.Instance = SPI2;
-  hi2s2.Init.Mode = I2S_MODE_MASTER_FULLDUPLEX;
+  hi2s2.Init.Mode = I2S_MODE_MASTER_TX;
   hi2s2.Init.Standard = I2S_STANDARD_PHILIPS;
   hi2s2.Init.DataFormat = I2S_DATAFORMAT_16B;
   hi2s2.Init.MCLKOutput = I2S_MCLKOUTPUT_DISABLE;
-  hi2s2.Init.AudioFreq = I2S_AUDIOFREQ_8K;
+  hi2s2.Init.AudioFreq = I2S_AUDIOFREQ_48K;
   hi2s2.Init.CPOL = I2S_CPOL_LOW;
   hi2s2.Init.FirstBit = I2S_FIRSTBIT_MSB;
   hi2s2.Init.WSInversion = I2S_WS_INVERSION_DISABLE;
@@ -316,10 +318,6 @@ static void MX_I2S2_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN I2S2_Init 2 */
-
-  /* USER CODE END I2S2_Init 2 */
-
 }
 
 /**
@@ -330,25 +328,62 @@ static void MX_I2S2_Init(void)
 static void MX_ICACHE_Init(void)
 {
 
-  /* USER CODE BEGIN ICACHE_Init 0 */
-
-  /* USER CODE END ICACHE_Init 0 */
-
-  /* USER CODE BEGIN ICACHE_Init 1 */
-
-  /* USER CODE END ICACHE_Init 1 */
-
-  /** Enable instruction cache (default 2-ways set associative cache)
-  */
+  // Enable instruction cache (default 2-ways set associative cache)
   if (HAL_ICACHE_Enable() != HAL_OK)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN ICACHE_Init 2 */
+}
 
-  /* USER CODE END ICACHE_Init 2 */
+
+/**
+  * @brief USART3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART3_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART3_Init 0 */
+
+  /* USER CODE END USART3_Init 0 */
+
+  /* USER CODE BEGIN USART3_Init 1 */
+
+  /* USER CODE END USART3_Init 1 */
+  huart3.Instance = USART3;
+  huart3.Init.BaudRate = 115200;
+  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.StopBits = UART_STOPBITS_1;
+  huart3.Init.Parity = UART_PARITY_NONE;
+  huart3.Init.Mode = UART_MODE_TX_RX;
+  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+  huart3.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
+  huart3.Init.ClockPrescaler = UART_PRESCALER_DIV1;
+  huart3.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_NO_INIT;
+  if (HAL_UART_Init(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetTxFifoThreshold(&huart3, UART_TXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_SetRxFifoThreshold(&huart3, UART_RXFIFO_THRESHOLD_1_8) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_UARTEx_DisableFifoMode(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART3_Init 2 */
+
+  /* USER CODE END USART3_Init 2 */
 
 }
+
 
 /**
   * @brief USB Initialization Function
@@ -357,14 +392,6 @@ static void MX_ICACHE_Init(void)
   */
 static void MX_USB_PCD_Init(void)
 {
-
-  /* USER CODE BEGIN USB_Init 0 */
-
-  /* USER CODE END USB_Init 0 */
-
-  /* USER CODE BEGIN USB_Init 1 */
-
-  /* USER CODE END USB_Init 1 */
   hpcd_USB_DRD_FS.Instance = USB_DRD_FS;
   hpcd_USB_DRD_FS.Init.dev_endpoints = 8;
   hpcd_USB_DRD_FS.Init.speed = USBD_FS_SPEED;
@@ -380,9 +407,7 @@ static void MX_USB_PCD_Init(void)
   {
     Error_Handler();
   }
-  /* USER CODE BEGIN USB_Init 2 */
 
-  /* USER CODE END USB_Init 2 */
 
 }
 
@@ -394,23 +419,21 @@ static void MX_USB_PCD_Init(void)
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
-  /* USER CODE BEGIN MX_GPIO_Init_1 */
 
-  /* USER CODE END MX_GPIO_Init_1 */
 
-  /* GPIO Ports Clock Enable */
+  // GPIO Ports Clock Enable
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
-  /*Configure GPIO pin : VBUS_DET_Pin */
+  // Configure GPIO pin : VBUS_DET_Pin
   GPIO_InitStruct.Pin = VBUS_DET_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(VBUS_DET_GPIO_Port, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : ARD_D1_TX_Pin ARD_D0_RX_Pin */
+  // Configure GPIO pins : ARD_D1_TX_Pin ARD_D0_RX_Pin
   GPIO_InitStruct.Pin = ARD_D1_TX_Pin|ARD_D0_RX_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
@@ -418,12 +441,82 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Alternate = GPIO_AF4_USART1;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  /* USER CODE BEGIN MX_GPIO_Init_2 */
 
-  /* USER CODE END MX_GPIO_Init_2 */
 }
 
-/* USER CODE BEGIN 4 */
+
+static void MX_GPDMA1_Init(void)
+{
+  DMA_NodeConfTypeDef node_config = {0};
+
+  // Peripheral clock enable
+  __HAL_RCC_GPDMA1_CLK_ENABLE();
+
+  handle_GPDMA1_Channel0.Instance = GPDMA1_Channel0;
+  handle_GPDMA1_Channel0.InitLinkedList.Priority = DMA_LOW_PRIORITY_HIGH_WEIGHT;
+  handle_GPDMA1_Channel0.InitLinkedList.LinkStepMode = DMA_LSM_FULL_EXECUTION;
+  handle_GPDMA1_Channel0.InitLinkedList.LinkAllocatedPort = DMA_LINK_ALLOCATED_PORT0;
+  handle_GPDMA1_Channel0.InitLinkedList.TransferEventMode = DMA_TCEM_BLOCK_TRANSFER;
+  handle_GPDMA1_Channel0.InitLinkedList.LinkedListMode = DMA_LINKEDLIST_CIRCULAR;
+  if (HAL_DMAEx_List_Init(&handle_GPDMA1_Channel0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  if (HAL_DMA_ConfigChannelAttributes(&handle_GPDMA1_Channel0, DMA_CHANNEL_NPRIV) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  node_config.NodeType = DMA_GPDMA_LINEAR_NODE;
+  node_config.Init.Request = GPDMA1_REQUEST_SPI2_TX;
+  node_config.Init.BlkHWRequest = DMA_BREQ_SINGLE_BURST;
+  node_config.Init.Direction = DMA_MEMORY_TO_PERIPH;
+  node_config.Init.SrcInc = DMA_SINC_INCREMENTED;
+  node_config.Init.DestInc = DMA_DINC_FIXED;
+  node_config.Init.SrcDataWidth = DMA_SRC_DATAWIDTH_HALFWORD;
+  node_config.Init.DestDataWidth = DMA_DEST_DATAWIDTH_HALFWORD;
+  node_config.Init.Priority = DMA_LOW_PRIORITY_HIGH_WEIGHT;
+  node_config.Init.SrcBurstLength = 1;
+  node_config.Init.DestBurstLength = 1;
+  node_config.Init.TransferAllocatedPort = DMA_SRC_ALLOCATED_PORT0 | DMA_DEST_ALLOCATED_PORT1;
+  node_config.Init.TransferEventMode = DMA_TCEM_BLOCK_TRANSFER;
+  node_config.Init.Mode = DMA_NORMAL;
+  node_config.DataHandlingConfig.DataExchange = DMA_EXCHANGE_NONE;
+  node_config.DataHandlingConfig.DataAlignment = DMA_DATA_RIGHTALIGN_ZEROPADDED;
+  node_config.TriggerConfig.TriggerMode = DMA_TRIGM_BLOCK_TRANSFER;
+  node_config.TriggerConfig.TriggerPolarity = DMA_TRIG_POLARITY_MASKED;
+  node_config.TriggerConfig.TriggerSelection = 0;
+  node_config.RepeatBlockConfig.RepeatCount = 1;
+  node_config.RepeatBlockConfig.SrcAddrOffset = 0;
+  node_config.RepeatBlockConfig.DestAddrOffset = 0;
+  node_config.RepeatBlockConfig.BlkSrcAddrOffset = 0;
+  node_config.RepeatBlockConfig.BlkDestAddrOffset = 0;
+  node_config.SrcAddress = (uint32_t) i2s_tx_buf;
+  node_config.DstAddress = (uint32_t) &SPI2->TXDR;
+  node_config.DataSize = I2S_TX_BUFFER_BYTES;
+
+  if (HAL_DMAEx_List_BuildNode(&node_config, &Node_GPDMA1_Channel0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_DMAEx_List_InsertNode_Tail(&List_GPDMA1_Channel0, &Node_GPDMA1_Channel0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_DMAEx_List_SetCircularMode(&List_GPDMA1_Channel0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (HAL_DMAEx_List_LinkQ(&handle_GPDMA1_Channel0, &List_GPDMA1_Channel0) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  // GPDMA1 interrupt Init 
+    HAL_NVIC_SetPriority(GPDMA1_Channel0_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(GPDMA1_Channel0_IRQn);
+}
 
 
 //--------------------------------------------------------------------+
@@ -473,6 +566,8 @@ static bool audio10_set_req_ep(tusb_control_request_t const *p_request, uint8_t 
         current_sample_rate = tu_unaligned_read32(pBuff) & 0x00FFFFFF;
 
         TU_LOG2("EP set current freq: %" PRIu32 "\r\n", current_sample_rate);
+
+        i2s_tx_set_sample_rate(current_sample_rate);
 
         return true;
       }
@@ -679,6 +774,8 @@ static bool audio20_clock_set_request(uint8_t rhport, audio20_control_request_t 
 
     TU_LOG1("Clock set current freq: %" PRIu32 "\r\n", current_sample_rate);
 
+    i2s_tx_set_sample_rate(current_sample_rate);
+
     return true;
   } else {
     TU_LOG1("Clock set request not supported, entity = %u, selector = %u, request = %u\r\n",
@@ -852,6 +949,9 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
   TU_LOG2("Set interface %d alt %d\r\n", itf, alt);
   if (ITF_NUM_AUDIO_STREAMING_SPK == itf && alt != 0) {
     blink_interval_ms = BLINK_STREAMING;
+    i2s_tx_start();
+  } else if (ITF_NUM_AUDIO_STREAMING_SPK == itf && alt == 0) {
+    i2s_tx_stop();
   }
 
   // Clear buffer when streaming format is changed
@@ -870,41 +970,32 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *p_reques
 // This task simulates an audio transfer callback, one frame is sent/received every 1ms.
 // In a real application, this would be replaced with actual I2S send/receive callback.
 void audio_task(void) {
-  static uint32_t start_ms = 0;
-  uint32_t curr_ms = app_millis();
-  if (start_ms == curr_ms) return;// not enough time
-  start_ms = curr_ms;
-  // When new data arrived, copy data from speaker buffer, to microphone buffer
-  // and send it over
-  // Only support speaker & headphone both have the same resolution
-  // If one is 16bit another is 24bit be care of LOUD noise !
-  spk_data_size = tud_audio_read(spk_buf, sizeof(spk_buf));
-  if (spk_data_size) {
-    if (current_resolution == 16) {
-      int16_t *src = (int16_t *) spk_buf;
-      int16_t *limit = (int16_t *) spk_buf + spk_data_size / 2;
-      int16_t *dst = (int16_t *) mic_buf;
-      while (src < limit) {
-        // Combine two channels into one
-        int32_t left = *src++;
-        int32_t right = *src++;
-        *dst++ = (int16_t) ((left >> 1) + (right >> 1));
-      }
-      tud_audio_write((uint8_t *) mic_buf, (uint16_t) (spk_data_size / 2));
-      spk_data_size = 0;
-    } else if (current_resolution == 24) {
-      int32_t *src = spk_buf;
-      int32_t *limit = spk_buf + spk_data_size / 4;
-      int32_t *dst = mic_buf;
-      while (src < limit) {
-        // Combine two channels into one
-        int32_t left = *src++;
-        int32_t right = *src++;
-        *dst++ = (int32_t) ((uint32_t) ((left >> 1) + (right >> 1)) & 0xffffff00ul);
-      }
-      tud_audio_write((uint8_t *) mic_buf, (uint16_t) (spk_data_size / 2));
-      spk_data_size = 0;
-    }
+  const uint32_t report_interval_ms = 1000;
+  static uint32_t last_report_ms = 0;
+  static uint32_t last_underflows = 0;
+
+  if (!i2s_streaming) {
+    last_report_ms = app_millis();
+    last_underflows = i2s_tx_underflows;
+    return;
+  }
+
+  if (i2s_tx_half_pending) {
+    i2s_tx_half_pending = false;
+    i2s_fill_half(true);
+  }
+
+  if (i2s_tx_full_pending) {
+    i2s_tx_full_pending = false;
+    i2s_fill_half(false);
+  }
+
+  if (app_millis() - last_report_ms >= report_interval_ms) {
+    uint32_t total = i2s_tx_underflows;
+    uint32_t delta = total - last_underflows;
+    printf("I2S underflows: total=%" PRIu32 " delta=%" PRIu32 "\r\n", total, delta);
+    last_underflows = total;
+    last_report_ms += report_interval_ms;
   }
 }
 
@@ -979,8 +1070,116 @@ size_t board_get_unique_id(uint8_t id[], size_t max_len) {
   return len;
 }
 
+static void i2s_fill_half(bool first_half) {
+  uint8_t *dst = i2s_tx_buf + (first_half ? 0 : I2S_TX_HALF_BYTES);
+  uint32_t bytes_read = (uint32_t) tud_audio_read(dst, I2S_TX_HALF_BYTES);
+  if (bytes_read != 0) {
+    i2s_apply_volume_16((int16_t *) dst, bytes_read / 2);
+  }
+  if (bytes_read < I2S_TX_HALF_BYTES) {
+    i2s_tx_underflows++;
+    memset(dst + bytes_read, 0, I2S_TX_HALF_BYTES - bytes_read);
+  }
+}
 
-/* USER CODE END 4 */
+static void i2s_tx_start(void) {
+  if (i2s_streaming) {
+    return;
+  }
+
+  i2s_fill_half(true);
+  i2s_fill_half(false);
+  i2s_tx_half_pending = false;
+  i2s_tx_full_pending = false;
+
+  if (HAL_I2S_Transmit_DMA(&hi2s2, (uint16_t *) i2s_tx_buf, I2S_TX_BUFFER_BYTES / 2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  i2s_streaming = true;
+}
+
+static void i2s_tx_stop(void) {
+  if (!i2s_streaming) {
+    return;
+  }
+  (void) HAL_I2S_DMAStop(&hi2s2);
+  i2s_streaming = false;
+}
+
+static void i2s_tx_set_sample_rate(uint32_t sample_rate) {
+  uint32_t audio_freq = I2S_AUDIOFREQ_48K;
+  if (sample_rate == 44100) {
+    audio_freq = I2S_AUDIOFREQ_44K;
+  }
+
+  bool was_streaming = i2s_streaming;
+  i2s_tx_stop();
+  (void) HAL_I2S_DeInit(&hi2s2);
+  hi2s2.Init.AudioFreq = audio_freq;
+  if (HAL_I2S_Init(&hi2s2) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  if (was_streaming) {
+    i2s_tx_start();
+  }
+}
+
+static void i2s_apply_volume_16(int16_t *samples, uint32_t sample_count) {
+  if (mute[0]) {
+    memset(samples, 0, sample_count * sizeof(int16_t));
+    return;
+  }
+
+  float vol_db = 0.0f;
+  if (tud_audio_version() == 2) {
+    vol_db = (float) volume[0] / 256.0f;
+  } else {
+    vol_db = (float) volume[0];
+  }
+
+  if (vol_db > 0.0f) {
+    vol_db = 0.0f;
+  }
+
+  float gain = powf(10.0f, vol_db / 20.0f);
+  if (gain >= 0.999f) {
+    return;
+  }
+
+  for (uint32_t i = 0; i < sample_count; i++) {
+    float scaled = (float) samples[i] * gain;
+    if (scaled > 32767.0f) {
+      samples[i] = 32767;
+    } else if (scaled < -32768.0f) {
+      samples[i] = -32768;
+    } else {
+      samples[i] = (int16_t) scaled;
+    }
+  }
+}
+
+void HAL_I2S_TxHalfCpltCallback(I2S_HandleTypeDef *hi2s) {
+  if (hi2s->Instance != SPI2) {
+    return;
+  }
+  i2s_tx_half_pending = true;
+}
+
+void HAL_I2S_TxCpltCallback(I2S_HandleTypeDef *hi2s) {
+  if (hi2s->Instance != SPI2) {
+    return;
+  }
+  i2s_tx_full_pending = true;
+}
+
+void HAL_I2S_ErrorCallback(I2S_HandleTypeDef *hi2s) {
+  (void) hi2s;
+  i2s_streaming = false;
+}
+
+
 
 /**
   * @brief  This function is executed in case of error occurrence.
@@ -988,13 +1187,11 @@ size_t board_get_unique_id(uint8_t id[], size_t max_len) {
   */
 void Error_Handler(void)
 {
-  /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
+  // User can add his own implementation to report the HAL error return state
   __disable_irq();
   while (1)
   {
   }
-  /* USER CODE END Error_Handler_Debug */
 }
 #ifdef USE_FULL_ASSERT
 /**
@@ -1006,9 +1203,7 @@ void Error_Handler(void)
   */
 void assert_failed(uint8_t *file, uint32_t line)
 {
-  /* USER CODE BEGIN 6 */
   /* User can add his own implementation to report the file name and line number,
      ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
-  /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */

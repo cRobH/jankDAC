@@ -15,6 +15,16 @@
   *
   ******************************************************************************
   */
+
+/*
+TODO: 
+  reenable icahce?
+  get pid/vid (https://pid.codes/howto/)
+
+
+*/
+
+
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
@@ -166,7 +176,8 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USB_PCD_Init();
-  MX_ICACHE_Init();
+  // Disabling Icache to see if it fixes the UID hard fault
+ // MX_ICACHE_Init();
   MX_I2S2_Init();
   /* USER CODE BEGIN 2 */
 
